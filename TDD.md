@@ -883,3 +883,12 @@
   target validation, test and production warnings-as-errors compilation, and
   the production release passed. The destructive 23,001-socket staging gate
   was not run.
+## Fly Replay E2E probe isolation
+
+- Red: `mix test test/fly_replay_e2e_test.exs` ran three independent
+  `mix run` probes and observed reused `fly-replay-<integer>` identifiers; the
+  focused assertion failed before the harness change.
+- Green: the same real local-relay test now uses a 128-bit per-invocation
+  identifier, closes data before client before control, and leaves zero active
+  WebSockets after three probes. A failed-upgrade regression also reports the
+  socket role and reason instead of a `MatchError`.
