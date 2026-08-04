@@ -14,7 +14,10 @@ defmodule PaseoRelay.PartitionClient do
   end
 
   @impl true
-  def handle_frame(_frame, observer), do: {:ok, observer}
+  def handle_frame({kind, payload}, observer) do
+    send(observer, {:partition_frame, self(), kind, payload})
+    {:ok, observer}
+  end
 
   @impl true
   def handle_disconnect(%{reason: reason}, observer) do

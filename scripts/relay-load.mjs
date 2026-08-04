@@ -6,6 +6,7 @@
  */
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const usage = `Usage: node scripts/relay-load.mjs [options]
 
@@ -19,13 +20,15 @@ const usage = `Usage: node scripts/relay-load.mjs [options]
   --batch-size <n>          Maximum pairs or servers opened concurrently (default: 100)
   --ramp-ms <milliseconds>  Delay between opening batches (default: 0)
   --scenario <name>         idle, sustained, burst, reconnect, or ownership (default: idle)
+  --start-on-sigusr1        Open sustained sockets now; publish after SIGUSR1
   --duration <seconds>      Measurement duration (default: 10)
   --rate <messages/s>       Bidirectional sustained rate (default: 10)
   --burst <n>               Bidirectional messages sent once after connection
   --reconnects <n>          Reconnection waves for reconnect scenario (default: 3)
-  --payload-bytes <n>       Frame size target (default: 128)
+  --payload-bytes <n>       Padding bytes after frame metadata (default: 128)
   --keepalive <seconds>     Send a small frame on every socket at this interval
   --cleanup-grace <seconds> Wait for clean close handshakes (default: 15)
+  --drain-timeout <seconds> Wait for all sent frames before teardown (default: 15)
   --relay-pid <pid>         Sample this relay process's RSS and CPU with ps
   --json                    Print one machine-readable JSON result (default)
 
@@ -58,8 +61,12 @@ function args(argv) {
   if (!new Set(["idle", "sustained", "burst", "reconnect", "ownership"]).has(scenario)) {
     throw new Error("--scenario must be idle, sustained, burst, reconnect, or ownership");
   }
+  const startOnSigusr1 = argv.includes("--start-on-sigusr1");
+  if (startOnSigusr1 && scenario !== "sustained") {
+    throw new Error("--start-on-sigusr1 requires --scenario sustained");
+  }
   return {
-    endpoints, serverId: value("--server-id", "load-server"), scenario,
+    endpoints, serverId: value("--server-id", "load-server"), scenario, startOnSigusr1,
     servers: integer("--servers", 1000),
     connectionPrefix: value("--connection-prefix", String(process.pid)),
     control: !argv.includes("--no-control"),
@@ -69,6 +76,7 @@ function args(argv) {
     burst: number("--burst", 0), reconnects: integer("--reconnects", 3),
     keepaliveMs: number("--keepalive", 0) * 1000,
     cleanupGraceMs: number("--cleanup-grace", 15) * 1000,
+    drainTimeoutMs: number("--drain-timeout", 15) * 1000,
     payloadBytes: Math.max(32, number("--payload-bytes", 128)), relayPid: value("--relay-pid", null),
   };
 }
@@ -141,7 +149,12 @@ function open(url, stats, keepaliveMs) {
       state.closed = true;
       clearInterval(state.keepalive);
       finish();
-      if (event.code !== 1000 && !(state.finalizing && [1001, 1005, 1012].includes(event.code))) fail();
+      if (event.code === 1000 || (state.finalizing && [1001, 1005, 1012].includes(event.code))) {
+        stats.normal_closes += 1;
+      } else {
+        stats.abnormal_closes += 1;
+        fail();
+      }
     });
   });
   opening.socket = socket;
@@ -166,12 +179,22 @@ async function connectPair(options, index, stats, latencies) {
     await finish(openings.map((opening) => opening.socket), stats, options.cleanupGraceMs);
     throw error;
   }
-  for (const socket of [server, client]) {
+  for (const [socket, expectedDirection] of [[server, "client"], [client, "server"]]) {
+    let expectedSequence = 1;
     socket.addEventListener("message", (event) => {
+      if (String(event.data) === "load-keepalive") {
+        stats.keepalive_frames_received += 1;
+        return;
+      }
       stats.frames_received += 1;
       stats.bytes_received += Buffer.byteLength(String(event.data));
-      const timestamp = Number(String(event.data).split(":", 1)[0]);
+      const [timestampText, direction, sequenceText] = String(event.data).split(":", 3);
+      const timestamp = Number(timestampText);
+      const sequence = Number(sequenceText);
       if (Number.isFinite(timestamp)) latencies.push(Date.now() - timestamp);
+      if (direction !== expectedDirection || sequence !== expectedSequence) stats.ordering_failures += 1;
+      expectedSequence = sequence + 1;
+      stats.on_receive?.();
     });
   }
   return { server, client };
@@ -251,53 +274,105 @@ function sampleRelay(pid) {
   return { rss_bytes: rssKb * 1024, cpu_percent: cpu };
 }
 
+async function waitForFrames(stats, target, timeoutMs) {
+  if (stats.frames_received >= target) return;
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { stats.on_receive = null; reject(new Error("Frame drain timed out")); }, timeoutMs);
+    stats.on_receive = () => {
+      if (stats.frames_received >= target) {
+        clearTimeout(timeout);
+        stats.on_receive = null;
+        resolve();
+      }
+    };
+    stats.on_receive();
+  });
+}
+
 async function main() {
   let options;
   try { options = args(process.argv.slice(2)); } catch (error) { console.error(error.message); process.exitCode = 2; return; }
   if (options.help) { process.stdout.write(usage); return; }
-  const stats = { connection_successes: 0, connection_failures: 0, cleanup_timeouts: 0, send_failures: 0, keepalive_frames_sent: 0, frames_sent: 0, frames_received: 0, bytes_sent: 0, bytes_received: 0 };
+  let releasePublisher;
+  let publisherStartedBySignal = false;
+  const publisherSignal = new Promise((resolve) => { releasePublisher = resolve; });
+  const resumePublisher = () => { publisherStartedBySignal = true; releasePublisher(); };
+  if (options.startOnSigusr1) process.on("SIGUSR1", resumePublisher);
+  else releasePublisher();
+  const stats = { connection_successes: 0, connection_failures: 0, normal_closes: 0, abnormal_closes: 0, cleanup_timeouts: 0, send_failures: 0, keepalive_frames_sent: 0, keepalive_frames_received: 0, frames_sent: 0, frames_received: 0, bytes_sent: 0, bytes_received: 0, ordering_failures: 0 };
   const latencies = [];
   const started = now();
   let setupDurationMs = 0;
+  let publisherWaitMs = 0;
   let steadyDurationMs = 0;
   let pairs = [];
   let servers = [];
   let control;
+  const relaySamples = [];
+  if (options.relayPid) relaySamples.push(sampleRelay(options.relayPid));
+  const sampleTimer = options.relayPid ? setInterval(() => relaySamples.push(sampleRelay(options.relayPid)), 1000) : null;
   try {
     if (options.scenario === "ownership") {
       servers = await connectServers(options, stats);
     } else if (options.control) {
       control = await open(endpoint(options.endpoints[0], { serverId: options.serverId, role: "server", v: "2" }), stats, options.keepaliveMs);
+      control.addEventListener("message", (event) => {
+        let message;
+        try { message = JSON.parse(String(event.data)); } catch { return; }
+        if (message.type !== "pong") return;
+        stats.frames_received += 1;
+        stats.bytes_received += Buffer.byteLength(String(event.data));
+        stats.on_receive?.();
+      });
     }
     if (options.scenario !== "ownership") {
       const waves = options.scenario === "reconnect" ? options.reconnects + 1 : 1;
       for (let wave = 0; wave < waves; wave += 1) {
         pairs = await connectPairs(options, wave, stats, latencies);
-        if (wave < waves - 1) { pairs.flatMap(Object.values).forEach((socket) => socket.close(1000, "load reconnect")); await sleep(100); }
+        if (wave < waves - 1) {
+          await finish(pairs.flatMap(Object.values), stats, options.cleanupGraceMs);
+          await sleep(100);
+        }
       }
     }
     setupDurationMs = now() - started;
+    const publisherWaitStarted = now();
+    await publisherSignal;
+    publisherWaitMs = now() - publisherWaitStarted;
+    process.off("SIGUSR1", resumePublisher);
     const steadyStarted = now();
-    const payload = (direction) => `${Date.now()}:${direction}:${"x".repeat(options.payloadBytes)}`;
-    const publish = () => pairs.forEach(({ server, client }) => { send(client, payload("client"), stats); send(server, payload("server"), stats); });
+    let sequence = 0;
+    const payload = (direction, currentSequence) => `${Date.now()}:${direction}:${currentSequence}:${"x".repeat(options.payloadBytes)}`;
+    const publish = () => {
+      sequence += 1;
+      pairs.forEach(({ server, client }) => { send(client, payload("client", sequence), stats); send(server, payload("server", sequence), stats); });
+      if (control) send(control, '{"type":"ping"}', stats);
+    };
     if (options.scenario === "burst" || options.burst) for (let i = 0; i < Math.max(1, options.burst); i += 1) publish();
     if (options.scenario === "sustained") {
       const period = Math.max(1, Math.floor(1000 / Math.max(1, options.rate)));
+      if (options.startOnSigusr1) publish();
       const timer = setInterval(publish, period);
       await sleep(options.durationMs);
       clearInterval(timer);
     } else {
       await sleep(options.durationMs);
     }
+    await waitForFrames(stats, stats.frames_sent, options.drainTimeoutMs);
     steadyDurationMs = now() - steadyStarted;
   } catch (error) {
     stats.error = error.message;
   } finally {
+    process.off("SIGUSR1", resumePublisher);
+    clearInterval(sampleTimer);
     await finish([...servers, ...pairs.flatMap(Object.values), ...(control ? [control] : [])], stats, options.cleanupGraceMs);
   }
   const durationMs = now() - started;
+  delete stats.on_receive;
   const resource = process.resourceUsage();
   const relay = sampleRelay(options.relayPid);
+  relaySamples.push(relay);
+  const validRelaySamples = relaySamples.filter(Boolean);
   const output = `${JSON.stringify({
     protocol: { version: 2, roles: ["server-data", "client"] }, scenario: options.scenario,
     endpoints: options.endpoints,
@@ -307,12 +382,18 @@ async function main() {
       ? options.servers
       : options.pairs * 2 + (options.control ? 1 : 0),
     setup_duration_ms: Math.round(setupDurationMs), steady_duration_ms: Math.round(steadyDurationMs), duration_ms: Math.round(durationMs),
-    ...stats, throughput_frames_per_second: Number((stats.frames_received / (durationMs / 1000)).toFixed(2)),
+    publisher_started_by_signal: publisherStartedBySignal, publisher_wait_ms: Math.round(publisherWaitMs),
+    ...stats, frames_lost: stats.frames_sent - stats.frames_received,
+    throughput_frames_per_second: Number((stats.frames_received / (durationMs / 1000)).toFixed(2)),
+    steady_throughput_frames_per_second: Number((stats.frames_received / Math.max(0.001, steadyDurationMs / 1000)).toFixed(2)),
     latency_ms: { p50: percentile(latencies, 0.5), p95: percentile(latencies, 0.95), p99: percentile(latencies, 0.99) },
     client: { rss_bytes: process.memoryUsage().rss, cpu_microseconds: resource.userCPUTime + resource.systemCPUTime }, relay,
+    relay_peak_rss_bytes: validRelaySamples.length ? Math.max(...validRelaySamples.map((sample) => sample.rss_bytes)) : null,
   })}\n`;
-  const status = stats.connection_failures || stats.cleanup_timeouts || stats.send_failures ? 1 : 0;
+  const status = stats.connection_failures || stats.cleanup_timeouts || stats.send_failures || stats.ordering_failures || stats.frames_sent !== stats.frames_received ? 1 : 0;
   process.stdout.write(output, () => process.exit(status));
 }
 
-main();
+export { endpoint, finish, open, send, sleep };
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();

@@ -3,7 +3,7 @@
 Paseo Relay is a distributed, protocol-compatible WebSocket relay for
 [Paseo](https://github.com/getpaseo/paseo). Daemons and clients meet here by
 `serverId`; frames are end-to-end encrypted by the Paseo protocol, so the
-relay never sees content. It is written in Elixir/OTP: Bandit serves the
+relay never sees content. It is written in Elixir/OTP: Cowboy/Ranch serves the
 public listener, a per-`serverId` owner process pins each session to one BEAM
 node via [Syn](https://hexdocs.pm/syn/readme.html), and a deployment adapter
 reroutes WebSocket upgrades to the owning node so frames never cross nodes.
@@ -45,12 +45,12 @@ MIX_ENV=prod mix release        # production release build
   on a deployment provider. Provider specifics live in explicit adapters
   under `deployment/`; the core speaks only the generic settings documented
   in README.md.
-- **Tests use real dependencies.** Real Bandit listeners, real WebSockets,
+- **Tests use real dependencies.** Real Cowboy/Ranch listeners, real WebSockets,
   real `:peer` BEAM nodes for distributed behavior — no mocks of the things
   under test. Every behavior change gets a red test first; record the
   red/green evidence in TDD.md as the existing entries do.
-- **Fail closed.** Sockets monitor the processes they depend on (owner,
-  Registry) and close with an explicit code rather than lingering in a
+- **Fail closed.** Sockets monitor the processes they depend on (Owner,
+  Writer, connection budget) and close with an explicit code rather than lingering in a
   half-alive state. Follow that pattern for anything new.
 - **No silent capacity changes.** Listener ceilings, connection limits, and
   timeouts are part of the operational contract in OPERATIONS.md — change

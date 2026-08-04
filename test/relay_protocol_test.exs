@@ -1,6 +1,11 @@
 defmodule PaseoRelay.RelayProtocolTest do
   use ExUnit.Case, async: false
 
+  setup do
+    assert PaseoRelay.Metrics.value(:active_websockets) == 0
+    :ok
+  end
+
   defmodule RelayClient do
     use WebSockex
 
@@ -20,13 +25,12 @@ defmodule PaseoRelay.RelayProtocolTest do
       send(owner, {:relay_closed, self(), reason})
       {:ok, owner}
     end
+
+    def handle_cast(:close, owner), do: {:close, owner}
   end
 
   test "v1 server and client forward ordered text and binary frames" do
-    port = available_port()
-    {:ok, relay} = Bandit.start_link(plug: PaseoRelay.Router, port: port)
-    Process.unlink(relay)
-    on_exit(fn -> Process.exit(relay, :shutdown) end)
+    port = start_relay()
 
     {:ok, daemon} = connect(v1_url(port, "server"))
     assert_receive {:relay_open, ^daemon}
@@ -40,15 +44,11 @@ defmodule PaseoRelay.RelayProtocolTest do
     assert_receive {:relay_frame, ^daemon, :text, "one"}
     assert_receive {:relay_frame, ^daemon, :binary, <<0, 255, 1>>}
 
-    GenServer.stop(daemon)
-    GenServer.stop(client)
+    close_clients([daemon, client])
   end
 
   test "v2 control pairs clients with data sockets and flushes buffered frames in order" do
-    port = available_port()
-    {:ok, relay} = Bandit.start_link(plug: PaseoRelay.Router, port: port)
-    Process.unlink(relay)
-    on_exit(fn -> Process.exit(relay, :shutdown) end)
+    port = start_relay()
 
     {:ok, control} = connect(v2_url(port, "server"))
     assert_receive {:relay_open, ^control}
@@ -69,33 +69,50 @@ defmodule PaseoRelay.RelayProtocolTest do
     :ok = WebSockex.send_frame(data, {:text, "from-daemon"})
     assert_receive {:relay_frame, ^client, :text, "from-daemon"}
 
-    GenServer.stop(control)
-    GenServer.stop(data)
-    GenServer.stop(client)
+    close_clients([control, data, client])
   end
 
   test "v2 control answers the legacy JSON ping with a JSON pong" do
-    port = available_port()
-    {:ok, relay} = Bandit.start_link(plug: PaseoRelay.Router, port: port)
-    Process.unlink(relay)
-    on_exit(fn -> Process.exit(relay, :shutdown) end)
+    port = start_relay()
 
     {:ok, control} = connect(v2_url(port, "server"))
     assert_receive {:relay_open, ^control}
     assert_control(control, %{"type" => "sync", "connectionIds" => []})
+    frames = PaseoRelay.Metrics.value(:frames_forwarded)
+    bytes = PaseoRelay.Metrics.value(:bytes_forwarded)
 
     :ok = WebSockex.send_frame(control, {:text, ~s({"type":"ping"})})
 
-    assert_control_type(control, "pong")
+    pong = assert_control_type(control, "pong")
+    assert PaseoRelay.Metrics.value(:frames_forwarded) == frames + 1
+    assert PaseoRelay.Metrics.value(:bytes_forwarded) == bytes + byte_size(pong)
 
-    GenServer.stop(control)
+    close_clients([control])
+  end
+
+  @tag timeout: 8_000
+  test "v2 control fails closed when its Owner stalls during a ping" do
+    port = start_relay()
+
+    {:ok, control} = connect(v2_url(port, "server"))
+    assert_receive {:relay_open, ^control}
+    assert_control(control, %{"type" => "sync", "connectionIds" => []})
+    owner = PaseoRelay.Ownership.owner_pid(v2_server_id(port))
+    owner_ref = Process.monitor(owner)
+    :ok = :sys.suspend(owner)
+
+    on_exit(fn ->
+      if Process.alive?(owner), do: :sys.resume(owner)
+    end)
+
+    :ok = WebSockex.send_frame(control, {:text, ~s({"type":"ping"})})
+    assert_receive {:relay_closed, ^control, {:remote, 1013, "Delivery unavailable"}}, 7_000
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
+    close_clients([control])
   end
 
   test "v2 resets an unresponsive control after nudging it to attach client data" do
-    port = available_port()
-    {:ok, relay} = Bandit.start_link(plug: PaseoRelay.Router, port: port)
-    Process.unlink(relay)
-    on_exit(fn -> Process.exit(relay, :shutdown) end)
+    port = start_relay()
 
     {:ok, control} = connect(v2_url(port, "server"))
     assert_receive {:relay_open, ^control}
@@ -107,14 +124,11 @@ defmodule PaseoRelay.RelayProtocolTest do
     assert_control(control, %{"type" => "sync", "connectionIds" => ["clt_watchdog"]}, 11_000)
     assert_receive {:relay_closed, ^control, {:remote, 1011, "Control unresponsive"}}, 6_000
 
-    GenServer.stop(client)
+    close_clients([control, client])
   end
 
-  test "v2 sockets fail closed when the registry crashes" do
-    port = available_port()
-    {:ok, relay} = Bandit.start_link(plug: PaseoRelay.Router, port: port)
-    Process.unlink(relay)
-    on_exit(fn -> Process.exit(relay, :shutdown) end)
+  test "v2 payload delivery has no node-wide registry process" do
+    port = start_relay()
 
     {:ok, client} = connect(v2_url(port, "client", "clt_registry_crash"))
     assert_receive {:relay_open, ^client}
@@ -122,32 +136,30 @@ defmodule PaseoRelay.RelayProtocolTest do
     {:ok, data} = connect(v2_url(port, "server", "clt_registry_crash"))
     assert_receive {:relay_open, ^data}
 
-    :ok = WebSockex.send_frame(client, {:text, "before-registry-crash"})
-    assert_receive {:relay_frame, ^data, :text, "before-registry-crash"}
+    assert Process.whereis(PaseoRelay.Registry) == nil
 
-    Process.exit(Process.whereis(PaseoRelay.Registry), :kill)
+    :ok = WebSockex.send_frame(client, {:text, "owner-routed"})
+    assert_receive {:relay_frame, ^data, :text, "owner-routed"}
 
-    assert_receive {:relay_closed, ^client, {:remote, 1012, "Registry unavailable"}}, 1_000
-    assert_receive {:relay_closed, ^data, {:remote, 1012, "Registry unavailable"}}, 1_000
+    close_clients([client, data])
   end
 
   test "v2 sockets fail closed when their distributed session owner exits" do
-    port = available_port()
-    {:ok, relay} = Bandit.start_link(plug: PaseoRelay.Router, port: port)
-    Process.unlink(relay)
-    on_exit(fn -> Process.exit(relay, :shutdown) end)
+    port = start_relay()
 
     {:ok, control} = connect(v2_url(port, "server"))
     assert_receive {:relay_open, ^control}
     assert_control(control, %{"type" => "sync", "connectionIds" => []})
 
-    Process.exit(PaseoRelay.Ownership.owner_pid("srv_v2_#{port}"), :session_conflict)
+    Process.exit(PaseoRelay.Ownership.owner_pid(v2_server_id(port)), :session_conflict)
 
     assert_receive {:relay_closed, ^control, {:remote, 1012, "Session owner moved"}}, 1_000
+    close_clients([control])
   end
 
   test "v2 socket initialization fails closed when its reserved owner has moved" do
     server_id = "srv_owner_moved_#{System.unique_integer([:positive])}"
+    budget_namespace = {:owner_moved, System.unique_integer([:positive])}
 
     {:ok, connection} =
       PaseoRelay.Connection.from_query(%{"serverId" => server_id, "role" => "server", "v" => "2"})
@@ -157,31 +169,42 @@ defmodule PaseoRelay.RelayProtocolTest do
     Process.exit(owner, :session_conflict)
     assert_receive {:DOWN, ^owner_down, :process, ^owner, :session_conflict}
 
-    state = %{connection: connection, owner: owner, reservation: reservation}
+    assert {:ok, admission} =
+             PaseoRelay.Capacity.admit_connection(
+               budget_namespace,
+               1,
+               PaseoRelay.Config.defaults().capacity_mutation_timeout_ms
+             )
 
-    assert {:stop, :normal, {1012, "Session expired"}, ^state} = PaseoRelay.Socket.init(state)
+    state = %{
+      admission: admission,
+      config: PaseoRelay.Config.defaults(),
+      connection: connection,
+      owner: owner,
+      reservation: reservation
+    }
+
+    assert {[{:close, 1012, "Session expired"}], failed_state} =
+             PaseoRelay.Socket.websocket_init(state)
+
+    PaseoRelay.Capacity.release_connection(failed_state.admission.token)
+    assert PaseoRelay.Capacity.active_connections(budget_namespace) == 0
   end
 
   @tag timeout: 75_000
   test "an idle websocket remains open past the adapter default timeout" do
-    port = available_port()
-    {:ok, relay} = Bandit.start_link(plug: PaseoRelay.Router, port: port)
-    Process.unlink(relay)
-    on_exit(fn -> Process.exit(relay, :shutdown) end)
+    port = start_relay()
 
     {:ok, socket} = connect(v1_url(port, "server"))
     assert_receive {:relay_open, ^socket}
 
     refute_receive {:relay_closed, ^socket, _}, 61_000
 
-    GenServer.stop(socket)
+    close_clients([socket])
   end
 
   test "v2 closes data with the last client and tells control it disconnected" do
-    port = available_port()
-    {:ok, relay} = Bandit.start_link(plug: PaseoRelay.Router, port: port)
-    Process.unlink(relay)
-    on_exit(fn -> Process.exit(relay, :shutdown) end)
+    port = start_relay()
 
     {:ok, control} = connect(v2_url(port, "server"))
     assert_receive {:relay_open, ^control}
@@ -193,20 +216,19 @@ defmodule PaseoRelay.RelayProtocolTest do
 
     {:ok, data} = connect(v2_url(port, "server", "clt_closes"))
     assert_receive {:relay_open, ^data}
+    :ok = WebSockex.send_frame(data, {:text, "data-attached"})
+    assert_receive {:relay_frame, ^client, :text, "data-attached"}
 
-    GenServer.stop(client)
+    close_client(client)
 
     assert_receive {:relay_closed, ^data, {:remote, 1001, "Client disconnected"}}
     assert_control(control, %{"type" => "disconnected", "connectionId" => "clt_closes"})
 
-    GenServer.stop(control)
+    close_clients([control, client, data])
   end
 
   test "v2 replaces duplicate daemon data without disconnecting the client route" do
-    port = available_port()
-    {:ok, relay} = Bandit.start_link(plug: PaseoRelay.Router, port: port)
-    Process.unlink(relay)
-    on_exit(fn -> Process.exit(relay, :shutdown) end)
+    port = start_relay()
 
     {:ok, client} = connect(v2_url(port, "client", "clt_replace"))
     assert_receive {:relay_open, ^client}
@@ -218,7 +240,7 @@ defmodule PaseoRelay.RelayProtocolTest do
     assert_receive {:relay_open, ^replacement}
     assert_receive {:relay_closed, _, {:remote, 1008, "Replaced by new connection"}}
 
-    GenServer.stop(client)
+    close_clients([client, original, replacement])
   end
 
   defp v1_url(port, role) do
@@ -231,15 +253,74 @@ defmodule PaseoRelay.RelayProtocolTest do
     {:ok, client}
   end
 
+  defp close_clients(clients) do
+    clients
+    |> Enum.uniq()
+    |> Enum.each(&close_client/1)
+
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    await_no_active_websockets(deadline)
+  end
+
+  defp close_client(client) do
+    if Process.alive?(client) do
+      reference = Process.monitor(client)
+      WebSockex.cast(client, :close)
+
+      receive do
+        {:DOWN, ^reference, :process, ^client, _reason} -> :ok
+      after
+        5_000 -> flunk("client #{inspect(client)} did not close its WebSocket synchronously")
+      end
+    end
+  end
+
+  defp await_no_active_websockets(deadline) do
+    if PaseoRelay.Metrics.value(:active_websockets) == 0 do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk("relay WebSockets did not return to zero")
+      end
+
+      Process.sleep(10)
+      await_no_active_websockets(deadline)
+    end
+  end
+
   defp v2_url(port, role, connection_id \\ nil) do
     query = if connection_id, do: "&connectionId=#{connection_id}", else: ""
-    "ws://127.0.0.1:#{port}/ws?serverId=srv_v2_#{port}&role=#{role}&v=2#{query}"
+    "ws://127.0.0.1:#{port}/ws?serverId=#{v2_server_id(port)}&role=#{role}&v=2#{query}"
+  end
+
+  defp v2_server_id(port) do
+    key = {__MODULE__, :server_id, port}
+
+    Process.get(key) ||
+      tap("srv_v2_#{port}_#{System.unique_integer([:positive])}", &Process.put(key, &1))
   end
 
   defp available_port do
     {:ok, socket} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
     {:ok, port} = :inet.port(socket)
     :ok = :gen_tcp.close(socket)
+    port
+  end
+
+  defp start_relay do
+    port = available_port()
+    reference = {:relay_protocol, System.unique_integer([:positive])}
+
+    start_supervised!(
+      {PaseoRelay.Listener,
+       ref: reference,
+       config: PaseoRelay.Config.defaults(),
+       ip: {127, 0, 0, 1},
+       port: port,
+       acceptors: 4,
+       max_connections: 1_000}
+    )
+
     port
   end
 
@@ -252,5 +333,6 @@ defmodule PaseoRelay.RelayProtocolTest do
     assert_receive {:relay_frame, ^client, :text, payload}
     assert %{"type" => ^type, "ts" => ts} = Jason.decode!(payload)
     assert is_integer(ts)
+    payload
   end
 end

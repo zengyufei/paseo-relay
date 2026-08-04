@@ -26,9 +26,9 @@ defmodule PaseoRelay.OwnershipTest do
     owner_record = Ownership.owner_pid("server-b")
     owner_down = Process.monitor(owner_record)
     Process.exit(owner, :kill)
-    assert_receive {:DOWN, ^owner_down, :process, ^owner_record, :normal}
+    assert_receive {:DOWN, ^owner_down, :process, ^owner_record, _reason}
 
-    assert :unowned = Ownership.resolve("server-b")
+    assert :unowned = await_unowned("server-b")
     assert :local = Ownership.claim("server-b", "opaque-owner-c")
   end
 
@@ -45,6 +45,26 @@ defmodule PaseoRelay.OwnershipTest do
     assert {:ok, _token} = Task.await(reservation, 1_000)
 
     Process.exit(owner, :kill)
+  end
+
+  defp await_unowned(server_id) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    await_unowned(server_id, deadline)
+  end
+
+  defp await_unowned(server_id, deadline) do
+    case Ownership.resolve(server_id) do
+      :unowned ->
+        :unowned
+
+      _owned ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          flunk("ownership did not clear for #{server_id}")
+        end
+
+        Process.sleep(10)
+        await_unowned(server_id, deadline)
+    end
   end
 end
 
@@ -78,7 +98,7 @@ defmodule PaseoRelay.DistributedOwnershipTest do
         )
     end
 
-    :erlang.set_cookie(node(), :relay_test_cookie)
+    cookie = Node.get_cookie() |> Atom.to_charlist()
 
     {:ok, peer_a, peer_node_a} =
       :peer.start_link(%{
@@ -86,7 +106,7 @@ defmodule PaseoRelay.DistributedOwnershipTest do
         connection: 0,
         args: [
           ~c"-setcookie",
-          ~c"relay_test_cookie",
+          cookie,
           ~c"-connect_all",
           ~c"false",
           ~c"-kernel",
@@ -103,7 +123,7 @@ defmodule PaseoRelay.DistributedOwnershipTest do
         connection: 0,
         args: [
           ~c"-setcookie",
-          ~c"relay_test_cookie",
+          cookie,
           ~c"-connect_all",
           ~c"false",
           ~c"-kernel",
@@ -139,9 +159,9 @@ defmodule PaseoRelay.DistributedOwnershipTest do
   } do
     results =
       Task.await_many([
-        Task.async(fn -> Ownership.route("server-c", "opaque-owner-a") end),
+        Task.async(fn -> await_route(node(), "server-c", "opaque-owner-a") end),
         Task.async(fn ->
-          :rpc.call(peer, Ownership, :route, ["server-c", "opaque-owner-b"])
+          await_route(peer, "server-c", "opaque-owner-b")
         end)
       ])
 
@@ -190,14 +210,55 @@ defmodule PaseoRelay.DistributedOwnershipTest do
     owner_record = Ownership.owner_pid("server-e")
     owner_down = Process.monitor(owner_record)
     Process.exit(local_session, :kill)
-    assert_receive {:DOWN, ^owner_down, :process, ^owner_record, :normal}, 5_500
+    assert_receive {:DOWN, ^owner_down, :process, ^owner_record, _reason}, 5_500
+    assert :unowned = await_resolve(node(), "server-e", :unowned)
+    assert :unowned = await_resolve(peer, "server-e", :unowned)
 
     remote_session = :rpc.call(peer, :erlang, :spawn, [:timer, :sleep, [:infinity]])
 
     assert :local =
              :rpc.call(peer, Ownership, :claim, ["server-e", "opaque-owner-b", remote_session])
 
-    assert {:reroute, "opaque-owner-b"} = Ownership.resolve("server-e")
+    assert {:reroute, "opaque-owner-b"} =
+             await_resolve(node(), "server-e", {:reroute, "opaque-owner-b"})
+
+    :rpc.call(peer, Process, :exit, [remote_session, :kill])
+  end
+
+  test "a client landing on a disjoint node reroutes to the real websocket owner", %{
+    peers: [peer_a, peer_b],
+    peer_ports: ports
+  } do
+    server_id = "disjoint-route-#{System.unique_integer([:positive])}"
+    port_a = Map.fetch!(ports, peer_a)
+    port_b = Map.fetch!(ports, peer_b)
+
+    {:ok, server} = connect_role_on(peer_a, port_a, server_id, "server", "shared")
+    assert_receive {:partition_open, ^server}
+
+    assert {:reroute, target} =
+             await_resolve(peer_b, server_id, {:reroute, Atom.to_string(peer_a)})
+
+    response = websocket_upgrade(port_b, server_id, "client", "shared")
+    assert "HTTP/1.1 409" <> _ = response
+    assert response =~ "x-reroute-target: #{peer_a}"
+    assert target == Atom.to_string(peer_a)
+
+    {:ok, client} = connect_role_on(peer_a, port_a, server_id, "client", "shared")
+    assert_receive {:partition_open, ^client}
+
+    assert :ok = :rpc.call(peer_a, WebSockex, :send_frame, [client, {:text, "to-server"}])
+    assert_receive {:partition_frame, ^server, :text, "to-server"}
+
+    assert :ok = :rpc.call(peer_a, WebSockex, :send_frame, [server, {:binary, <<1, 2, 3>>}])
+    assert_receive {:partition_frame, ^client, :binary, <<1, 2, 3>>}
+
+    :rpc.call(peer_a, Process, :exit, [client, :kill])
+    :rpc.call(peer_a, Process, :exit, [server, :kill])
+    owner = :rpc.call(peer_a, Ownership, :owner_pid, [server_id])
+    :rpc.call(peer_a, Process, :exit, [owner, :kill])
+    assert :unowned = await_resolve(peer_a, server_id, :unowned)
+    assert :unowned = await_resolve(peer_b, server_id, :unowned)
   end
 
   @tag timeout: 30_000
@@ -245,7 +306,6 @@ defmodule PaseoRelay.DistributedOwnershipTest do
   } do
     prefix = "surge-#{System.unique_integer([:positive])}"
     observers = [node(), peer_a, peer_b]
-    baseline = registry_counts(observers)
 
     entries =
       [:local, peer_a, peer_b]
@@ -267,8 +327,10 @@ defmodule PaseoRelay.DistributedOwnershipTest do
     assert length(results) == @surge_count
     assert Enum.count(results, &match?({:ok, {:local, _, _}}, &1)) == @surge_count
 
-    expected_counts = expected_registry_counts(baseline, entries)
-    assert expected_counts == await_registry_counts(observers, expected_counts)
+    expected_owners =
+      Map.new(entries, fn {landing, server_id} -> {server_id, landing_node(landing)} end)
+
+    assert expected_owners == await_registry_owners(observers, expected_owners)
 
     observer_by_landing = %{:local => peer_a, peer_a => peer_b, peer_b => node()}
 
@@ -293,39 +355,19 @@ defmodule PaseoRelay.DistributedOwnershipTest do
   defp start_relay(peer) do
     load_module(peer, PartitionClient)
 
-    :ok =
-      :rpc.call(peer, :application, :set_env, [
-        :paseo_relay,
-        :operations,
-        [host: "127.0.0.1", ip: {127, 0, 0, 1}, port: 0, drain: false]
-      ])
+    config = %{
+      PaseoRelay.Config.defaults()
+      | port: 0,
+        ownership_target: Atom.to_string(peer),
+        reroute_header: "x-reroute-target"
+    }
 
-    :ok =
-      :rpc.call(peer, :application, :set_env, [
-        :paseo_relay,
-        :ownership_target,
-        Atom.to_string(peer)
-      ])
-
-    :ok =
-      :rpc.call(peer, :application, :set_env, [
-        :paseo_relay,
-        :reroute_header,
-        "x-reroute-target"
-      ])
+    :ok = :rpc.call(peer, :application, :set_env, [:paseo_relay, :runtime, config])
 
     {:ok, _applications} =
       :rpc.call(peer, :application, :ensure_all_started, [:paseo_relay])
 
-    children = :rpc.call(peer, Supervisor, :which_children, [PaseoRelay.Supervisor])
-
-    {_id, listener, :supervisor, _modules} =
-      Enum.find(children, fn {_id, _pid, _type, modules} -> Bandit in modules end)
-
-    {:ok, {_address, port}} =
-      :rpc.call(peer, ThousandIsland, :listener_info, [listener])
-
-    port
+    :rpc.call(peer, :ranch, :get_port, [PaseoRelay.Listener])
   end
 
   defp load_module(peer, module) do
@@ -334,7 +376,13 @@ defmodule PaseoRelay.DistributedOwnershipTest do
   end
 
   defp connect_on(peer, port, server_id) do
-    url = "ws://127.0.0.1:#{port}/ws?serverId=#{server_id}&role=server&v=2"
+    connect_role_on(peer, port, server_id, "server", "")
+  end
+
+  defp connect_role_on(peer, port, server_id, role, connection_id) do
+    url =
+      "ws://127.0.0.1:#{port}/ws?serverId=#{server_id}&role=#{role}&v=2&connectionId=#{connection_id}"
+
     :rpc.call(peer, PartitionClient, :start, [url, self()])
   end
 
@@ -369,10 +417,14 @@ defmodule PaseoRelay.DistributedOwnershipTest do
   end
 
   defp websocket_upgrade(port, server_id) do
+    websocket_upgrade(port, server_id, "client", "")
+  end
+
+  defp websocket_upgrade(port, server_id, role, connection_id) do
     {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false])
 
     request =
-      "GET /ws?serverId=#{server_id}&role=client&v=2 HTTP/1.1\r\n" <>
+      "GET /ws?serverId=#{server_id}&role=#{role}&v=2&connectionId=#{connection_id} HTTP/1.1\r\n" <>
         "Host: relay.test\r\n" <>
         "Upgrade: websocket\r\n" <>
         "Connection: Upgrade\r\n" <>
@@ -396,55 +448,55 @@ defmodule PaseoRelay.DistributedOwnershipTest do
   defp target_for(:local), do: "local"
   defp target_for(peer), do: Atom.to_string(peer)
 
-  defp expected_registry_counts(baseline, entries) do
-    increments =
-      entries
-      |> Enum.map(fn {landing, _server_id} -> landing_node(landing) end)
-      |> Enum.frequencies()
-
-    Map.new(baseline, fn {{observer, origin}, count} ->
-      {{observer, origin}, count + Map.get(increments, origin, 0)}
-    end)
-  end
-
   defp landing_node(:local), do: node()
   defp landing_node(peer), do: peer
 
-  defp registry_counts(nodes) do
-    Map.new(
-      for observer <- nodes,
-          origin <- nodes,
-          do: {{observer, origin}, registry_count(observer, origin)}
+  defp registry_owners(observer, server_ids) do
+    server_ids
+    |> Task.async_stream(
+      fn server_id -> {server_id, lookup_owner(observer, server_id)} end,
+      max_concurrency: 256,
+      ordered: false,
+      timeout: 5_000
     )
+    |> Map.new(fn {:ok, entry} -> entry end)
   end
 
-  defp registry_count(observer, origin) do
-    if observer == node() do
-      :syn.registry_count(:paseo_relay_owners, origin)
-    else
-      :rpc.call(observer, :syn, :registry_count, [:paseo_relay_owners, origin])
+  defp lookup_owner(observer, server_id) do
+    result =
+      if observer == node(),
+        do: :syn.lookup(:paseo_relay_owners, server_id),
+        else: :rpc.call(observer, :syn, :lookup, [:paseo_relay_owners, server_id])
+
+    case result do
+      {process, _metadata} -> node(process)
+      :undefined -> nil
     end
   end
 
-  defp await_registry_counts(observers, expected) do
+  defp await_registry_owners(observers, expected) do
     deadline = System.monotonic_time(:millisecond) + 30_000
-    await_registry_counts(observers, expected, deadline)
+    await_registry_owners(observers, expected, deadline)
   end
 
-  defp await_registry_counts(observers, expected, deadline) do
-    counts = registry_counts(observers)
+  defp await_registry_owners(observers, expected, deadline) do
+    server_ids = Map.keys(expected)
+    owners = Map.new(observers, &{&1, registry_owners(&1, server_ids)})
 
-    if counts == expected do
-      counts
+    if Enum.all?(owners, fn {_observer, actual} -> actual == expected end) do
+      expected
     else
       if System.monotonic_time(:millisecond) >= deadline do
-        flunk(
-          "Syn registry did not converge: expected #{inspect(expected)}, got #{inspect(counts)}"
-        )
+        mismatches =
+          Map.new(owners, fn {observer, actual} ->
+            {observer, Enum.count(expected, fn {name, owner} -> actual[name] != owner end)}
+          end)
+
+        flunk("Syn registry did not converge: mismatches #{inspect(mismatches)}")
       end
 
-      Process.sleep(10)
-      await_registry_counts(observers, expected, deadline)
+      Process.sleep(100)
+      await_registry_owners(observers, expected, deadline)
     end
   end
 
@@ -534,6 +586,33 @@ defmodule PaseoRelay.DistributedOwnershipTest do
       {:local, owner, _reservation} -> [owner]
       {:reroute, _target} -> []
     end)
+  end
+
+  defp await_route(observer, server_id, target) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    await_route(observer, server_id, target, deadline)
+  end
+
+  defp await_route(observer, server_id, target, deadline) do
+    result =
+      if observer == node() do
+        Ownership.route(server_id, target)
+      else
+        :rpc.call(observer, Ownership, :route, [server_id, target])
+      end
+
+    case result do
+      {:unavailable, :owner} ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          flunk("ownership route remained unavailable on #{observer}")
+        end
+
+        Process.sleep(10)
+        await_route(observer, server_id, target, deadline)
+
+      available ->
+        available
+    end
   end
 
   defp start_syn(peer) do

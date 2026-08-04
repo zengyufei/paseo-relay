@@ -17,14 +17,11 @@ Every recurring observability question must be answerable from `/metrics`,
 logs, or a new low-cardinality metric — never by interrogating live
 processes.
 
-- **Never call `:sys.get_state/1` (or any full-state dump) on the production
-  Registry or any singleton process.** Copying a large state term blocks the
-  process for the duration of the copy. This has wedged a production node:
-  full-state dumps issued while a reconnect surge was in flight saturated the
-  Registry mailbox, WebSocket attaches timed out and failed closed, the VM
-  degraded until its health check went critical, and the Machine had to be
-  restarted. The Registry serializes every frame on its node; seconds of
-  blocking are an outage.
+- **Never call `:sys.get_state/1` (or any full-state dump) on a production
+  Owner or singleton process.** Copying a large state term blocks that process.
+  The retired node-wide Registry was previously wedged this way during a
+  reconnect surge. Payloads now bypass global coordination, but full-state
+  diagnostics remain unsafe and unnecessary.
 - Targeted RPC reads during an incident are acceptable: `:syn.lookup/2` for a
   single key, one counter, one small map. Full-table or full-state scans are
   not, and the busiest node during a surge is the worst possible target.
@@ -57,21 +54,30 @@ BEAM node so its frames never cross nodes. Additional Machines increase total
 fleet capacity for new sessions; they cannot split one exceptionally large
 session across Machines.
 
-The listener has a second, provider-independent safety ceiling. Thousand Island
-runs 100 acceptors with 200 connections each by default, for 20,000 live
-connections per node. When one acceptor is full it performs five bounded retries
-one second apart, then closes the new connection and emits
-`paseo_relay_connection_rejections_total`. The values are configurable through
-the generic `PASEO_RELAY_ACCEPTORS`,
-`PASEO_RELAY_CONNECTIONS_PER_ACCEPTOR`,
-`PASEO_RELAY_CONNECTION_RETRY_COUNT`, and
-`PASEO_RELAY_CONNECTION_RETRY_WAIT_MS` settings.
+The relay has a second, provider-independent safety ceiling. The application
+multiplies `PASEO_RELAY_ACCEPTORS` by
+`PASEO_RELAY_CONNECTIONS_PER_ACCEPTOR`, yielding 20,000 active WebSockets per
+node by default. Every valid local upgrade reserves one node-local slot before
+Cowboy takes over the WebSocket. At the ceiling, the upgrade receives `503`,
+`paseo_relay_connection_rejections_total` increments, and existing WebSockets
+remain open. Slots are released explicitly at normal termination and by process
+monitoring after abnormal death.
 
-There is deliberately no application queue for WebSocket upgrades. Holding an
-upgraded socket while ownership work waits would consume the same scarce file
-descriptor and memory and turn overload into an invisible client timeout. The
-listener provides a bounded wait; after that, shedding the connection lets the
-existing client reconnect policy provide backpressure.
+Ranch's own connection accounting is not this safety boundary: Cowboy removes
+an upgraded connection from Ranch accounting at WebSocket takeover. Ranch
+limits only concurrent pre-upgrade HTTP handling and applies TCP backlog
+pressure there. Pre-upgrade HTTP parsing and unread request bodies have a
+15-second idle deadline; upgraded WebSockets keep their protocol-level infinite
+idle lifetime. The relay adds no application queue for over-capacity upgrades;
+an explicit retryable rejection is safer than retaining another socket and
+hiding overload as a timeout.
+
+The native-Cowboy capacity run held 15,000 distinct real WebSockets with zero
+failures and measured 1,300,512,768 bytes peak relay RSS on the test host. That
+is the measured real-socket envelope; the generic 20,000-slot ceiling is a
+final admission fuse, not evidence that 20,000 sockets fit every 2 GB runtime.
+Provider limits and machine sizing must stay inside a locally measured envelope
+with room for the configured ingress budget and VM overhead.
 
 ## Failure behavior
 
@@ -105,25 +111,167 @@ existing client reconnect policy provide backpressure.
   re-claim on healthy nodes within seconds. Do not wait for a wedged node to
   recover on its own, and do not diagnose it with anything heavier than its
   logs. Planned follow-up: an in-VM watchdog that self-terminates the node
-  when its own readiness or Registry call latency degrades, so this recovery
+  when its own readiness or Owner call latency degrades, so this recovery
   does not require an operator.
 - **Fly Proxy loses the path to a locally healthy Machine:** forced-instance
-  requests time out even though loopback HTTP, the Registry, CPU, and memory
+  requests time out even though loopback HTTP, Owner routing, CPU, and memory
   remain healthy. New clients cannot reach sessions owned by that Machine.
   Start and verify the stopped spare in the same region before disturbing the
   affected Machine, then restart the affected Machine once. If the failure
   returns after a restart, replace the Machine on a fresh Fly host instead of
-  repeatedly restarting it. This is a platform ingress failure, not Registry
-  pressure, and changing relay size or Registry architecture will not repair it.
-- **The singleton Registry falls behind during a reconnect surge:** its mailbox
-  grows and targeted calls become slow even when total CPU is below saturation.
-  Off-heap mailbox storage prevents queued frame payloads from bloating the
-  Registry process heap, but it does not remove serialization. A short queue
-  spike that returns to zero without rejections or readiness loss is a warning,
-  not a reason to restart. A sustained or growing queue, timed-out targeted
-  calls, attachment failures, or lost readiness means the node is wedged; use
-  the restart procedure above and prioritize splitting Registry ownership by
-  `serverId`.
+  repeatedly restarting it. This is a platform ingress failure, not relay
+  pressure, and changing relay size will not repair it.
+- **A destination stops reading:** its Writer permits only one payload write.
+  Source reads remain suspended while its WebSocket process can still service
+  full-duplex writes. The Writer records slow-consumer shedding at its delivery
+  deadline, before the longer TCP send deadline, while healthy fanout
+  destinations continue. If an active source disappears after its frame reaches
+  the destination write barrier, that Writer fails closed and rejects its queue;
+  it never grants a successor behind the still-outstanding send. A peer that
+  resumes reading in time can receive the queued `1013`; a peer whose TCP
+  receive path remains completely blocked can only observe transport closure
+  because no WebSocket close frame can traverse that blocked path. Increasing
+  `paseo_relay_backpressured_sources` is expected during brief congestion;
+  sustained growth plus delivery timeouts or slow-consumer closes is actionable.
+- **A session Owner stops servicing its mailbox:** the absolute delivery
+  deadline closes the source and forcibly retires the timed-out Owner. Syn
+  removes its registration, so reconnect can claim a fresh Owner instead of
+  adding work to an indefinitely stalled session authority.
+- **A control destination stops reading:** all control notifications use that
+  destination's Writer. Once its bounded control queue fills, the control socket
+  receives retryable `1013`; an accepted queued notification that reaches its
+  absolute deadline also closes the destination instead of disappearing.
+  Notifications cannot accumulate in an unbounded WebSocket mailbox.
+- **Ingress reaches the node budget:** every complete message Cowboy delivers
+  receives a token before protocol dispatch. Frames already buffered when source
+  reads are suspended are separately tokenized and retained in source order. One
+  monitored capacity ledger owns connection slots, weighted reservations, active
+  deliveries, pressure order, and all related gauges. Socket death atomically
+  drops every token, including after a forced heap-fuse exit. If the ledger dies,
+  the runtime supervisor stops the listener and every old connection before
+  restarting the ledger and reopening admission; this intentionally creates a
+  node-local reconnect wave rather than overlapping accounting epochs. If the
+  weighted total would cross the configured ceiling, that source closes with
+  retryable `1013`; `paseo_relay_ingress_reserved_bytes` never exceeds the
+  ceiling.
+
+  Known remote owners are rerouted without consuming local capacity. For local
+  or unowned sessions, connection admission is acquired before reserving or
+  creating an Owner, so a capacity or pressure rejection cannot leave transient
+  session state behind. Pre-upgrade HTTP parsing and unread request bodies have
+  a finite idle lifetime; upgraded WebSockets explicitly retain an infinite
+  protocol idle timeout and rely on their application lifecycle instead.
+
+  Public state-changing decisions capture the exact current Capacity PID and
+  wait up to the configured Capacity mutation timeout for that epoch's reply.
+  A reply is the decision. If the captured PID dies first, the caller returns
+  the existing unavailable result. If the call times out, the caller kills that
+  exact PID and returns
+  unavailable; it never kills a process subsequently registered under the same
+  name. The runtime supervisor's `:rest_for_one` ordering then stops the
+  listener and every socket from the failed epoch before replacement Capacity
+  can admit traffic. This deliberately turns an authority stall at that bound
+  into a node-local reconnect wave so that no externally failed mutation
+  survives in a later accounting epoch. The generic default and Fly template
+  currently select 5,000 ms, provisionally; the combined staging epoch gate must
+  certify that value for the intended topology and Machine size before rollout.
+
+  The Fly-only manual gate distributes exactly 23,001 real WebSockets across
+  three exact Machines: 7,667 per Machine, below both deployed application
+  ceilings and Fly placement limits. It is a short POSIX procedure around three
+  ordinary `relay-load.mjs` sustained runs. The target shard establishes all
+  sockets but holds its publisher while the unaffected shards run normally.
+  Immediately after `:sys.suspend/1` acknowledges, the procedure signals the
+  target publisher to start. Every pair then sends a frame containing
+  1,024 padding bytes plus timestamp, direction, and sequence metadata in both
+  directions once per second, while each control socket sends a valid ping,
+  including throughout the target Machine's Capacity stall. The procedure reads
+  the deployed ceiling and mutation timeout
+  from each release, resets each Machine's cgroup-v2 `memory.peak`, and records
+  the exact target Capacity PID. The fault reports the VM monotonic timestamp
+  immediately after `:sys.suspend/1` acknowledges. The deliberately started
+  public message traffic then causes the configured timeout to invalidate that
+  exact epoch, making the acknowledgement the lower-bound clock origin. The
+  first replacement observation must fall between that timeout and the timeout
+  plus the validated replacement-observation tolerance, provisionally 1,000 ms;
+  the final result records both monotonic timestamps and their difference.
+
+  EXIT, SIGINT, and SIGTERM cleanup always asks the target release to kill the
+  captured PID only if it is still the registered Capacity, then stops load
+  processes, waits the Owner grace interval, and requires every exact-Machine
+  proxy to be ready with zero Capacity gauges. Every release must report all
+  three staged server IDs unowned, and each final `memory.peak` must remain under
+  the operator-supplied ceiling. Unaffected shard JSON permits zero connection
+  failure, send failure, ordering failure, cleanup timeout, or frame loss. All
+  7,667 old target sockets must report an abnormal epoch disconnect. A second
+  full 7,667-socket sustained run then reuses the same target `serverId` through
+  the replacement listener and requires zero connection, send, ordering,
+  cleanup, or frame-loss failures. The exact credentials, three-Machine
+  topology, timeout, replacement tolerance, application connection ceiling,
+  memory ceiling, and free local ports are operator inputs. The gate has not
+  been run.
+
+  The gate requires a persistent operator artifact directory before destructive
+  work. It retains each unchanged load-producer JSON, bounded redacted stderr,
+  child exits, initial/final diagnostics, per-observer ownership, timing,
+  readiness, raw final metrics, and identified `memory.peak` reset/read evidence.
+  One short `summary.json` is emitted on success or failure and contains file
+  references, key numeric checks, and stable
+  `{check,node,shard,expected,actual,reason}` failures. Evidence is never reduced
+  into a second certification schema or deleted by cleanup.
+
+  Every sustained result must cover its requested duration. Unaffected and
+  replacement traffic must send at least
+  `(duration_seconds * rate - 2) * 7,667` frames; the affected minimum uses the
+  configured timeout window because that epoch intentionally drains. This
+  conservative two-tick allowance prevents a one-tick result from passing a
+  90-second or 10-second run while tolerating interval startup variance.
+
+  Initial connection admission monitors Cowboy's persistent connection
+  process. Attachment is accepted only from that same process and reuses its
+  monitor; the five-second attachment lease still removes a live holder that
+  never upgrades. Message tokens belong to an already-monitored socket.
+  Release, finish, and cancel are idempotent one-way cleanup optimizations;
+  holder `DOWN` is sufficient for correctness. Synchronous pressure checks and
+  watermark changes use the same exact-PID timeout invalidation, so an
+  unavailable result cannot be followed by a late mutation in a surviving
+  epoch.
+
+  One tagged Capacity status observation supplies authority availability, the
+  configured listener namespace's admission state, and all four transient
+  gauges through a read-only one-second call. It fits inside the production
+  readiness probe's two-second deadline and never kills Capacity.
+  `/ready` returns `503` when Capacity is unavailable, memory pressure is active,
+  or the application WebSocket ceiling is full. The Fly soft limit and temporary
+  occupancy of the ingress byte budget are not readiness conditions. `/metrics`
+  performs the same single observation per render; when Capacity is unavailable
+  it reports ready zero, retains independent counters, sessions, histograms, and
+  BEAM metrics, and omits the four unknown Capacity gauges. Actual Capacity
+  process death remains the only epoch trigger: `:rest_for_one` stops
+  the listener and old connections before a replacement ledger reopens
+  admission.
+
+  The masked client data-frame wire ceiling remains exactly 32 MiB, so Cowboy
+  bounds each complete or reassembled fragmented message to `32 MiB - 14 bytes`
+  and sends `1009` for one byte more. Inbound v2 control input is limited to
+  64 KiB, charged through JSON parsing, and oversized input receives `1009`.
+  Cowboy has already assembled a complete payload before `websocket_handle/2`
+  can request its byte-only Capacity token. The 32 MiB ceiling, per-WebSocket
+  heap fuse, and node memory watermark limit and shed that staging risk, but do
+  not create a strict pre-parser memory reservation. During a Capacity stall,
+  one completed payload per active socket can remain staged for the configured
+  mutation timeout before the epoch is drained. That reconnect and memory
+  exposure must be exercised at the documented 23,001-socket staging gate
+  before rollout; it has not been certified by the local suite. Incomplete
+  fragments also remain inside Cowboy until completion. A pressure episode
+  pauses new connection and message admission, sheds the oldest blocked
+  delivery first and then the newest active sockets as a conservative proxy for
+  recent fragment retention, and sizes subsequent bounded batches from measured
+  BEAM memory relief. Admission
+  resumes only below a one-maximum-message hysteresis threshold. The generic
+  watermark is disabled because the safe threshold depends on the runtime
+  limit; a strict generic deployment must set a nonzero threshold. The 2 GB Fly
+  template enables it at 1.5 GB.
 - **Two nodes concurrently claim a previously unowned `serverId`:** Syn favors
   availability, so both WebSockets can initially open against different local
   owners. Conflict resolution keeps one owner and closes sockets on the loser
@@ -160,11 +308,11 @@ Protect connected users before restoring the preferred topology.
   that has acquired sessions during an incident merely to restore the preferred
   topology.
 - Restart a Machine when it is wedged or unreachable, not merely busy. Afterward,
-  verify the Machine's forced-instance readiness, cluster readiness, Registry
+  verify the Machine's forced-instance readiness, cluster readiness, Owner
   responsiveness, and reconnect/session convergence before taking another
   action.
 - Do not repeatedly restart the same Machine. A recurring Fly ingress failure
-  calls for replacement on a fresh host; recurring Registry wedges call for an
+  calls for replacement on a fresh host; recurring relay pressure calls for an
   application fix. Repeated restarts only create repeated user-visible blips.
 - During unattended monitoring, do not deploy, resize, destroy Machines, change
   configuration, or run load tests. Record every intervention, its evidence,
@@ -176,6 +324,11 @@ Fly scrapes `/metrics` every 15 seconds when the deployment adapter's metrics
 configuration is enabled. Custom series are local to a Machine and receive Fly
 labels such as app, region, host, and instance. Do not add `serverId` or
 `connectionId` as labels; their cardinality is unbounded.
+
+The endpoint fetches Capacity availability, admission state, and all transient
+capacity gauges in one bounded ledger call. If that authority is stalled, the
+scrape returns a zero ready gauge and omits the four unknown Capacity gauge
+families rather than fabricating zeros or serially blocking once per gauge.
 
 Start with dashboards and alerts for:
 

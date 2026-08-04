@@ -7,56 +7,86 @@ defmodule PaseoRelay.Operations do
   surface. A drain is activated through `PaseoRelay.Drain.begin/0`; it never
   depends on a deployment provider's control plane.
   """
-  use Plug.Router
+  @behaviour :cowboy_handler
 
-  plug(:match)
-  plug(:dispatch)
+  @impl true
+  def init(request, options) do
+    {status, content_type, body} = response(:cowboy_req.path(request), options)
 
-  get "/health" do
-    send_json(conn, 200, "ok")
+    request =
+      :cowboy_req.reply(
+        status,
+        %{"content-type" => content_type},
+        body,
+        request
+      )
+
+    {:ok, request, nil}
   end
 
-  get "/ready" do
-    if ready?(conn) do
-      send_json(conn, 200, "ready")
+  def response(path), do: response(path, operation_options(configured_runtime()))
+
+  def response(path, %{minimum_cluster_size: _minimum_cluster_size} = config),
+    do: response(path, operation_options(config))
+
+  def response("/health", _options), do: {200, "application/json", ~s({"status":"ok"})}
+
+  def response("/ready", %{config: config, connection_budget: budget}) do
+    if ready_without_capacity?(config) and ready_capacity?(capacity_status(budget)) do
+      {200, "application/json", ~s({"status":"ready"})}
     else
-      send_json(conn, 503, "unready")
+      {503, "application/json", ~s({"status":"unready"})}
     end
   end
 
-  get "/metrics" do
+  def response("/metrics", %{config: config, connection_budget: budget}) do
+    capacity_status = capacity_status(budget)
+
     body =
       [
         "# HELP paseo_relay_ready Whether this node admits new relay work.",
         "# TYPE paseo_relay_ready gauge",
-        "paseo_relay_ready #{if(ready?(conn), do: 1, else: 0)}",
+        "paseo_relay_ready #{if(ready?(config, capacity_status), do: 1, else: 0)}",
         "# HELP paseo_relay_draining Whether this node is draining.",
         "# TYPE paseo_relay_draining gauge",
-        "paseo_relay_draining #{if(draining?(conn), do: 1, else: 0)}",
-        PaseoRelay.Metrics.render()
+        "paseo_relay_draining #{if(draining?(), do: 1, else: 0)}",
+        PaseoRelay.Metrics.render(capacity_status)
       ]
       |> Enum.join("\n")
       |> Kernel.<>("\n")
 
-    conn
-    |> put_resp_content_type("text/plain; version=0.0.4")
-    |> send_resp(200, body)
+    {200, "text/plain; version=0.0.4", body}
   end
 
-  match _ do
-    send_resp(conn, 404, "not found\n")
+  def response(_path, _config), do: {404, "text/plain", "not found\n"}
+
+  defp draining?, do: PaseoRelay.Drain.draining?()
+
+  defp ready?(config, capacity_status) do
+    ready_without_capacity?(config) and ready_capacity?(capacity_status)
   end
 
-  defp draining?(conn) do
-    _ = conn
-    PaseoRelay.Drain.draining?()
+  defp ready_without_capacity?(config),
+    do: not draining?() and PaseoRelay.Ownership.ready?(config.minimum_cluster_size)
+
+  defp ready_capacity?({:available, %{admission: :open}}), do: true
+  defp ready_capacity?(_unavailable_or_closed), do: false
+
+  defp capacity_status({namespace, limit}), do: PaseoRelay.Capacity.status(namespace, limit)
+
+  defp operation_options(config) do
+    %{
+      config: config,
+      connection_budget: {
+        PaseoRelay.Listener,
+        config.acceptors * config.connections_per_acceptor
+      }
+    }
   end
 
-  defp ready?(conn), do: not draining?(conn) and PaseoRelay.Ownership.ready?()
-
-  defp send_json(conn, status, state) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, ~s({"status":"#{state}"}))
+  defp configured_runtime do
+    :paseo_relay
+    |> Application.get_env(:runtime, PaseoRelay.Config.defaults())
+    |> PaseoRelay.Config.normalize()
   end
 end
