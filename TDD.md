@@ -1,5 +1,14 @@
 # TDD evidence
 
+## Resolve the Fly Dockerfile relative to its config
+
+- Red: `fly deploy --build-only --push -c deployment/fly/fly.toml` resolved the
+  repository-relative value as
+  `deployment/fly/deployment/fly/Dockerfile` and stopped before building.
+- Green: the Fly config now names `Dockerfile` relative to its own directory,
+  while `scripts/ci.sh --validate-fly-build` resolves the same path using Fly's
+  semantics.
+
 ## Native Cowboy delivery and admission reshape
 
 - Red: the standard WebSock boundary could not suspend TCP reads while keeping

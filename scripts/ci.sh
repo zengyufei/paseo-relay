@@ -30,6 +30,9 @@ validate_fly_build() {
 }
 
 fly_dockerfile="$(fly_dockerfile_from_config)"
+if [[ "${fly_dockerfile}" != /* ]]; then
+  fly_dockerfile="$(dirname "${fly_config}")/${fly_dockerfile}"
+fi
 readonly fly_dockerfile
 validate_fly_build
 
