@@ -1,8 +1,7 @@
 defmodule PaseoRelay.FlyReplayE2ETest do
   use ExUnit.Case, async: false
 
-  @runner
-  "Code.require_file(\"deployment/fly/replay-e2e.exs\"); PaseoRelay.FlyReplayE2E.run(System.argv())"
+  @runner "Code.require_file(\"deployment/fly/replay-e2e.exs\"); PaseoRelay.FlyReplayE2E.run(System.argv())"
 
   @tag timeout: 60_000
   test "independent replay probes use distinct ids and leave no active sockets" do
