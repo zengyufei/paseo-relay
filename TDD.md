@@ -14,6 +14,10 @@
   Zig, XZ, 7-Zip, Docker, or a working WSL installation, so no local Burrito
   binary build, Mix suite, health/readiness smoke, or WebSocket load smoke is
   claimed. The tagged release workflow runs those checks on the target runners.
+- Release-smoke correction: the first `v0.1.0` release built all five Burrito
+  binaries successfully but every smoke job exited after unpacking because the
+  wrapper forwards CLI arguments to the Mix release command. The smoke scripts,
+  systemd unit, and direct-start example now use the required `start` command.
 
 ## Resolve the Fly Dockerfile relative to its config
 

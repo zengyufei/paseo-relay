@@ -33,7 +33,7 @@ The relay should listen on loopback behind a TLS reverse proxy:
 export PASEO_RELAY_HOST=127.0.0.1
 export PASEO_RELAY_PORT=4000
 export PASEO_RELAY_MIN_CLUSTER_SIZE=1
-./paseo-relay-vVERSION-linux-x86_64
+./paseo-relay-vVERSION-linux-x86_64 start
 ```
 
 The existing `PASEO_RELAY_*` settings documented in the root README remain

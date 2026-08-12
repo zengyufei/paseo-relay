@@ -25,7 +25,7 @@ trap cleanup EXIT
 PASEO_RELAY_HOST=127.0.0.1 \
 PASEO_RELAY_PORT="${port}" \
 PASEO_RELAY_MIN_CLUSTER_SIZE=1 \
-  "${binary}" >standalone-smoke.log 2>&1 &
+  "${binary}" start >standalone-smoke.log 2>&1 &
 relay_pid=$!
 
 for _attempt in $(seq 1 300); do
