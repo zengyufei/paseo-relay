@@ -15,7 +15,7 @@ $env:PASEO_RELAY_MIN_CLUSTER_SIZE = "1"
 $logPath = Join-Path $PWD "standalone-smoke.log"
 $errorLogPath = Join-Path $PWD "standalone-smoke-error.log"
 $process = Start-Process -FilePath $resolvedBinary -PassThru -WindowStyle Hidden `
-  -ArgumentList "start" `
+  -ArgumentList "--no-halt" `
   -RedirectStandardOutput $logPath -RedirectStandardError $errorLogPath
 
 try {

@@ -10,7 +10,7 @@ Group=paseo-relay
 EnvironmentFile=/etc/paseo-relay/paseo-relay.env
 Environment=HOME=/var/lib/paseo-relay
 WorkingDirectory=/var/lib/paseo-relay
-ExecStart=/usr/local/bin/paseo-relay start
+ExecStart=/usr/local/bin/paseo-relay --no-halt
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=30

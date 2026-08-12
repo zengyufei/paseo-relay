@@ -14,10 +14,12 @@
   Zig, XZ, 7-Zip, Docker, or a working WSL installation, so no local Burrito
   binary build, Mix suite, health/readiness smoke, or WebSocket load smoke is
   claimed. The tagged release workflow runs those checks on the target runners.
-- Release-smoke correction: the first `v0.1.0` release built all five Burrito
-  binaries successfully but every smoke job exited after unpacking because the
-  wrapper forwards CLI arguments to the Mix release command. The smoke scripts,
-  systemd unit, and direct-start example now use the required `start` command.
+- Release-smoke correction: `v0.1.0` built all five Burrito binaries successfully
+  but every smoke job exited after unpacking. `v0.1.1` proved that `start` is
+  forwarded as an Elixir script argument (`No file named start`). Burrito 1.6.0
+  invokes `elixir.start_cli`; its CLI source shows the required `--no-halt` flag
+  prevents the default `System.halt/0` after the boot script starts the relay.
+  Smoke scripts, systemd, and the direct-start example now use `--no-halt`.
 
 ## Resolve the Fly Dockerfile relative to its config
 

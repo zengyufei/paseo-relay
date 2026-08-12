@@ -21,12 +21,12 @@ const unixSmoke = readFileSync(new URL("./smoke-standalone.sh", import.meta.url)
 const windowsSmoke = readFileSync(new URL("./smoke-standalone.ps1", import.meta.url), "utf8");
 const service = readFileSync(new URL("../deployment/standalone/paseo-relay.service", import.meta.url), "utf8");
 
-if (!unixSmoke.includes('"${binary}" start') || !windowsSmoke.includes('-ArgumentList "start"')) {
-  throw new Error("standalone smoke scripts must invoke the release start command");
+if (!unixSmoke.includes('"${binary}" --no-halt') || !windowsSmoke.includes('-ArgumentList "--no-halt"')) {
+  throw new Error("standalone smoke scripts must prevent the Elixir CLI from halting the release");
 }
 
-if (!service.includes("ExecStart=/usr/local/bin/paseo-relay start")) {
-  throw new Error("the systemd unit must invoke the release start command");
+if (!service.includes("ExecStart=/usr/local/bin/paseo-relay --no-halt")) {
+  throw new Error("the systemd unit must prevent the Elixir CLI from halting the release");
 }
 
 for (const [name, os, cpu] of expectedTargets) {
