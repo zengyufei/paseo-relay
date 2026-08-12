@@ -116,10 +116,13 @@ blocked deliveries are shed first.
 See [`OPERATIONS.md`](OPERATIONS.md) for the production failure model,
 capacity policy, and alerting signals.
 
-Build a production release with `MIX_ENV=prod asdf exec mix release`, or build
-the generic container with `docker build -t paseo-relay .`. The explicit
-provider adapter in [`deployment/fly`](deployment/fly) translates its platform
-node input into `RELEASE_NODE`; nothing under `lib/` or `scripts/` depends on it.
+Build a production release with `MIX_ENV=prod asdf exec mix release`, build a
+generic container with `docker build -t paseo-relay .`, or use the
+[standalone deployment](deployment/standalone/README.md) for self-extracting
+Linux, Windows, and macOS executables that require no installed BEAM toolchain.
+The explicit provider adapter in [`deployment/fly`](deployment/fly) translates
+its platform node input into `RELEASE_NODE`; nothing under `lib/` or `scripts/`
+depends on it.
 
 Cluster ownership uses [Syn](https://hexdocs.pm/syn/readme.html), an eventually
 consistent distributed process registry. A network partition can temporarily

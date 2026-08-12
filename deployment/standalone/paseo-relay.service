@@ -1,0 +1,25 @@
+[Unit]
+Description=Paseo Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=paseo-relay
+Group=paseo-relay
+EnvironmentFile=/etc/paseo-relay/paseo-relay.env
+Environment=HOME=/var/lib/paseo-relay
+WorkingDirectory=/var/lib/paseo-relay
+ExecStart=/usr/local/bin/paseo-relay
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+LimitNOFILE=100000
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/paseo-relay
+
+[Install]
+WantedBy=multi-user.target

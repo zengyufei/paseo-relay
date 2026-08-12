@@ -8,11 +8,31 @@ defmodule PaseoRelay.MixProject do
       elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      releases: [paseo_relay: [include_executables_for: [:unix]]],
+      releases: releases(),
       # Cowlib's cookie advisory concerns its unused client encoder. Cowboy 2.17
       # rejects the response-splitting advisory's invalid headers server-side.
       hex: [ignore_advisories: ["CVE-2026-43966", "CVE-2026-43969"]],
       deps: deps()
+    ]
+  end
+
+  def releases do
+    standalone? = System.get_env("PASEO_RELAY_STANDALONE_BUILD") == "true"
+
+    [
+      paseo_relay: [
+        steps: if(standalone?, do: [:assemble, &Burrito.wrap/1], else: [:assemble]),
+        include_executables_for: [:unix],
+        burrito: [
+          targets: [
+            linux_x86_64: [os: :linux, cpu: :x86_64],
+            linux_aarch64: [os: :linux, cpu: :aarch64],
+            windows_x86_64: [os: :windows, cpu: :x86_64],
+            macos_x86_64: [os: :darwin, cpu: :x86_64],
+            macos_aarch64: [os: :darwin, cpu: :aarch64]
+          ]
+        ]
+      ]
     ]
   end
 
@@ -25,6 +45,7 @@ defmodule PaseoRelay.MixProject do
   defp deps do
     [
       {:cowboy, "~> 2.17"},
+      {:burrito, "== 1.6.0", runtime: false},
       {:dns_cluster, "~> 0.2.0"},
       {:jason, "~> 1.4"},
       {:syn, "~> 3.4"},

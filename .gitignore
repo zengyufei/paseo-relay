@@ -24,3 +24,7 @@ paseo_relay-*.tar
 
 # Temporary files, for example, from tests.
 /tmp/
+
+# Self-extracting release binaries and staging artifacts.
+/burrito_out/
+/dist/

@@ -1,5 +1,20 @@
 # TDD evidence
 
+## Standalone Burrito releases
+
+- Red: the repository only produced an OTP release or Docker image; it had no
+  self-extracting release targets, standalone build/smoke scripts, tagged
+  release workflow, checksum manifest, or non-container service documentation.
+- Green: `node scripts/validate-standalone-release.mjs` verifies the five named
+  Burrito targets, the opt-in wrap step, and preservation of the normal OTP
+  release path. Actionlint 1.7.12 validates both workflows, ShellCheck 0.11.0
+  validates both Bash scripts, PowerShell parses the Windows smoke script, and
+  `git diff --check` passes.
+- Runtime verification boundary: this Windows host does not have Elixir, OTP,
+  Zig, XZ, 7-Zip, Docker, or a working WSL installation, so no local Burrito
+  binary build, Mix suite, health/readiness smoke, or WebSocket load smoke is
+  claimed. The tagged release workflow runs those checks on the target runners.
+
 ## Resolve the Fly Dockerfile relative to its config
 
 - Red: `fly deploy --build-only --push -c deployment/fly/fly.toml` resolved the
